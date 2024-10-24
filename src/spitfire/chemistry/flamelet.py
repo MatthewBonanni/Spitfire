@@ -20,8 +20,8 @@ import numpy as np
 from numpy import array
 from numpy import any, logical_or, isinf, isnan
 from scipy.special import erfinv
-from scipy.sparse import csc_matrix
-from scipy.sparse.linalg import splu as superlu_factor
+from scipy.sparse import csc_matrix, hstack, vstack
+from scipy.sparse.linalg import spsolve
 from numpy.linalg import norm
 from spitfire.griffon.griffon import py_btddod_full_factorize, py_btddod_full_solve, \
     py_btddod_scale_and_add_diagonal
@@ -266,6 +266,76 @@ def compute_dissipation_rate(mixture_fraction,
     return x
 
 
+def max_dissipation_rate_from_stoich(stoich_dissipation_rate,
+                                     mech,
+                                     fuel_stream,
+                                     oxy_stream,
+                                     form='Peters'):
+    """Compute the maximum scalar dissipation rate from the stoichiometric scalar dissipation rate
+
+        Parameters
+        ----------
+        stoich_dissipation_rate : float
+            the stoichiometric value of the dissipation rate
+        mech : spitfire.chemistry.mechanism.ChemicalMechanismSpec instance
+            the chemical mechanism
+        fuel_stream : Cantera.Quantity (a Spitfire stream) or Cantera.Solution object
+            the fuel stream
+        oxy_stream : Cantera.Quantity (a Spitfire stream) or Cantera.Solution object
+            the oxidizer stream
+        form : str, optional
+            the form of the dissipation rate's dependency on mixture fraction, defaults to 'Peters', which
+            uses the form of N. Peters, Turbulent Combustion, 2000.
+            Specifying anything else will yield a constant scalar dissipation rate.
+
+        Returns
+        -------
+        max_dissipation_rate : float
+            the maximum value of the dissipation rate
+        """
+    zst = mech.stoich_mixture_fraction(fuel_stream, oxy_stream)
+    if form == 'Peters' or form == 'peters':
+        max_dissipation_rate = stoich_dissipation_rate / np.exp(-2. * (erfinv(2. * zst - 1.)) ** 2)
+    else:
+        max_dissipation_rate = stoich_dissipation_rate
+    return max_dissipation_rate
+
+
+def stoich_dissipation_rate_from_max(max_dissipation_rate,
+                                     mech,
+                                     fuel_stream,
+                                     oxy_stream,
+                                     form='Peters'):
+    """Compute the stoichiometric scalar dissipation rate from the maximum scalar dissipation rate
+
+        Parameters
+        ----------
+        max_dissipation_rate : float
+            the maximum value of the dissipation rate
+        mech : spitfire.chemistry.mechanism.ChemicalMechanismSpec instance
+            the chemical mechanism
+        fuel_stream : Cantera.Quantity (a Spitfire stream) or Cantera.Solution object
+            the fuel stream
+        oxy_stream : Cantera.Quantity (a Spitfire stream) or Cantera.Solution object
+            the oxidizer stream
+        form : str, optional
+            the form of the dissipation rate's dependency on mixture fraction, defaults to 'Peters', which
+            uses the form of N. Peters, Turbulent Combustion, 2000.
+            Specifying anything else will yield a constant scalar dissipation rate.
+        
+        Returns
+        -------
+        stoich_dissipation_rate : float
+            the stoichiometric value of the dissipation rate
+        """
+    zst = mech.stoich_mixture_fraction(fuel_stream, oxy_stream)
+    if form == 'Peters' or form == 'peters':
+        stoich_dissipation_rate = max_dissipation_rate * np.exp(-2. * (erfinv(2. * zst - 1.)) ** 2)
+    else:
+        stoich_dissipation_rate = max_dissipation_rate
+    return stoich_dissipation_rate
+
+
 class Flamelet(object):
     """An API for solving flamelet equations in composing tabulated chemistry libraries
     """
@@ -458,12 +528,8 @@ class Flamelet(object):
                     self._dissipation_rate_form = fs.dissipation_rate_form
                     self._x = compute_dissipation_rate(self._z, self._max_dissipation_rate, self._dissipation_rate_form)
                 elif fs.stoich_dissipation_rate is not None:
-                    if fs.dissipation_rate_form in ['peters', 'Peters']:
-                        z_st = self.mechanism.stoich_mixture_fraction(self.fuel_stream, self.oxy_stream)
-                        self._max_dissipation_rate = fs.stoich_dissipation_rate / np.exp(
-                            -2. * (erfinv(2. * z_st - 1.)) ** 2)
-                    elif fs.dissipation_rate_form == 'constant':
-                        self._max_dissipation_rate = fs.stoich_dissipation_rate
+                    self._max_dissipation_rate = max_dissipation_rate_from_stoich(
+                        fs.stoich_dissipation_rate, self._mechanism, self.fuel_stream, self.oxy_stream, fs.dissipation_rate_form)
                     self._dissipation_rate_form = fs.dissipation_rate_form
                     self._x = compute_dissipation_rate(self._z, self._max_dissipation_rate, self._dissipation_rate_form)
         self._lewis_numbers = np.ones(self._n_species)
@@ -1776,3 +1842,230 @@ class Flamelet(object):
                 for p in transient_library.props:
                     steady_library[p] = transient_library[p][-1, :].ravel()
                 return steady_library
+
+    def _compute_df_dmu(self, state, mu):
+        """Compute the derivative of the RHS with respect to mu (log of scalar dissipation rate)"""
+        nzi = self._nz_interior
+        neq = self._n_equations
+
+        def DD(y):
+            dydx = np.gradient(y) / np.gradient(self._z)
+            return np.gradient(dydx) / np.gradient(self._z)
+
+        T = np.hstack([
+            self.oxy_stream.T,
+            state[::neq],
+            self.fuel_stream.T])
+        Tpp = 0.5 * DD(T)[1:-1]
+
+        Ypp = np.zeros((self._mechanism.n_species - 1, nzi))
+        for i in range(neq - 1):
+            Y = np.hstack([
+                self.oxy_stream.Y[i],
+                state[1 + i::neq],
+                self.fuel_stream.Y[i]])
+            Ypp[i] = 0.5 * np.divide(DD(Y)[1:-1], self._z[1:-1])
+        
+        full_mat = np.vstack([Tpp, Ypp])
+        return np.exp(mu) * full_mat.flatten('F')
+    
+    def _compute_tangent(self, state, mu, jac_method):
+        """Compute the tangent vector"""
+        J = jac_method(state)
+        df_dmu = self._compute_df_dmu(state, mu)
+        tangent = np.zeros(self._n_dof + 1)
+        py_btddod_full_factorize(J, self._nz_interior, self._n_equations,
+                                 self._block_thomas_l_values,
+                                 self._block_thomas_d_pivots)
+        py_btddod_full_solve(J,
+                             self._block_thomas_l_values,
+                             self._block_thomas_d_pivots,
+                             -df_dmu, self._nz_interior, self._n_equations, tangent[:-1])
+        tangent[-1] = 1.0
+        tangent /= np.linalg.norm(tangent)
+
+        # DEBUG
+        # df_dmu_T = df_dmu[::self._n_equations]
+        # tangent_T = tangent[::self._n_equations]
+        # breakpoint()
+        # tangent *= -1 # DEBUG
+        return tangent
+    
+    def _take_continuation_step(self, delta_s, tangent, state0, mu0, update_tangent_inner=False,
+                                max_iter=100, tol=1e3, alpha_init=1.0, alpha_min=1e-4, alpha_reduce=0.5):
+        """Take a step along the S-curve using pseudo-arc length continuation
+
+        Parameters
+        ----------
+        delta_s : float
+            The arc length step size
+        tangent : np.ndarray
+            The tangent vector from the previous point
+        state0 : np.ndarray
+            The previous state
+        mu0 : float
+            The previous log(scalar dissipation rate)
+        update_tangent_inner : bool
+            Whether to update the tangent during the newton iteration
+        max_iter : int, optional
+            Maximum number of Newton iterations
+        tol : float, optional
+            Convergence tolerance for Newton iterations
+        alpha_init : float, optional
+            Initial step size for line search
+        alpha_min : float, optional
+            Minimum step size for line search
+        alpha_reduce : float, optional
+            Factor to reduce alpha by in line search
+
+        Returns
+        -------
+        state : np.ndarray
+            The new state
+        mu : float
+            The new log(scalar dissipation rate)
+        tangent : np.ndarray
+            The new tangent vector
+        """
+        rhs_method = getattr(self, '_' + self._heat_transfer + '_rhs')
+        jac_method = getattr(self, '_' + self._heat_transfer + '_jac')
+        jac_csc_method = getattr(self, '_' + self._heat_transfer + '_jac_csc')
+
+        def extended_system(x):
+            state = x[:-1]
+            mu = x[-1]
+            
+            # Update scalar dissipation rate
+            chi_st = np.exp(mu)
+            self._max_dissipation_rate = max_dissipation_rate_from_stoich(chi_st, self._mechanism, self.fuel_stream, self.oxy_stream, self._dissipation_rate_form)
+            self._x = self._compute_dissipation_rate(self._z, self._max_dissipation_rate, self._dissipation_rate_form)
+            
+            f = rhs_method(0., state)
+            g = np.dot(tangent[:-1], state - state0) + tangent[-1] * (mu - mu0) - delta_s
+            return np.append(f, g)
+
+        def extended_jacobian(x):
+            state = x[:-1]
+            mu = x[-1]
+
+            # Update scalar dissipation rate
+            chi_st = np.exp(mu)
+            self._max_dissipation_rate = max_dissipation_rate_from_stoich(chi_st, self._mechanism, self.fuel_stream, self.oxy_stream, self._dissipation_rate_form)
+            self._x = self._compute_dissipation_rate(self._z, self._max_dissipation_rate, self._dissipation_rate_form)
+
+            J = jac_csc_method(state)
+            df_dmu = self._compute_df_dmu(state, mu)
+            
+            # Construct extended Jacobian while maintaining sparsity
+            J_extended = vstack([
+                hstack([J, csc_matrix(df_dmu.reshape(-1, 1))]),
+                hstack([csc_matrix(tangent[:-1].reshape(1, -1)), csc_matrix([[tangent[-1]]])])
+            ])
+            
+            return J_extended
+
+        # Initial guess - predictor step
+        x0 = np.append(state0, mu0)
+        x = x0 + delta_s * tangent
+
+        # Newton iterations
+        for iter in range(max_iter):
+            f = extended_system(x)
+            f_norm = np.linalg.norm(f)
+
+            print(f"Iteration {iter}, |f| = {f_norm}")
+            if f_norm <= tol:
+                print(f"Converged after {iter} iterations.")
+                break
+
+            J = extended_jacobian(x)
+            dx = spsolve(J, -f)
+
+            # Line search
+            alpha = alpha_init
+            while alpha > alpha_min:
+                x_new = x + alpha * dx
+                f_new = extended_system(x_new)
+                if np.linalg.norm(f_new) < f_norm:
+                    x = x_new
+                    break
+                alpha *= alpha_reduce
+                # print("line search reducing step size to {0:.3f}".format(alpha))
+
+            if alpha <= alpha_min:
+                raise ValueError("Line search failed to find a suitable step size.")
+
+            x = x_new
+            iter += 1
+        
+        if f_norm > tol:
+            raise ValueError(f"Newton iteration failed to converge after {max_iter} iterations!")
+        
+        state = x[:-1]
+        mu = x[-1]
+        return state, mu
+
+    def compute_s_curve(self, n_points=100, delta_s=0.1, verbose=True):
+        """Compute the S-curve using pseudo-arc length continuation
+
+        Parameters
+        ----------
+        n_points : int
+            Number of points to compute on the S-curve
+        delta_s : float
+            Initial arc length step size
+        verbose : bool
+            Whether to print progress
+
+        Returns
+        -------
+        Library
+            A library containing the S-curve data
+        """
+        
+        # Solve initial steady state
+        initial_library = self.compute_steady_state(tolerance=1e-6, verbose=True)
+        state = self._current_state
+        chi_st = stoich_dissipation_rate_from_max(self._max_dissipation_rate, self._mechanism, self.fuel_stream, self.oxy_stream, self._dissipation_rate_form)
+        mu = np.log(chi_st)
+
+        if verbose:
+            print(f'1/{n_points} (chi_st = {chi_st:.1e} 1/s), T_max = {np.max(state[::self._n_equations]):.1f} K')
+
+        # Compute initial tangent
+        rhs_method = getattr(self, '_' + self._heat_transfer + '_rhs')
+        jac_method = getattr(self, '_' + self._heat_transfer + '_jac')
+
+        # Initialize results storage
+        results = [initial_library]
+        chi_st_values = [chi_st]
+
+        # Main continuation loop
+        for i in range(1, n_points):
+            tangent = self._compute_tangent(state, mu, jac_method)
+            state_new, mu_new = self._take_continuation_step(delta_s, tangent, state, mu)
+            
+            # TODO - detect changes in tangent direction and reverse if necessary
+            chi_st_new = np.exp(mu_new)
+
+            # Update state and create library
+            self._current_state = state_new
+            new_library = self.make_library_from_interior_state(state_new)
+            results.append(new_library)
+            chi_st_values.append(chi_st_new)
+
+            if verbose:
+                print(f'{i + 1}/{n_points} (chi_st = {chi_st_new:.1e} 1/s), T_max = {np.max(state_new[::self._n_equations]):.1f} K')
+
+            # Prepare for next iteration
+            state, mu = state_new, mu_new
+
+        # Combine results into a single library
+        s_curve_library = Library(Dimension('scalar_dissipation', np.array(chi_st_values)),
+                                  Dimension('mixture_fraction', self._z))
+        s_curve_library.extra_attributes['mech_spec'] = self._mechanism
+
+        for prop in results[0].props:
+            s_curve_library[prop] = np.vstack([lib[prop] for lib in results])
+
+        return s_curve_library

@@ -336,6 +336,80 @@ def build_adiabatic_slfm_library(flamelet_specs,
         return output_library
 
 
+def build_adiabatic_slfm_psalc_library(flamelet_specs,
+                                       n_points=200,
+                                       delta_s=0.1,
+                                       max_turns=2,
+                                       verbose=True,
+                                       solver_verbose=False,
+                                       diss_rate_log_scaled=True):
+    """Build a flamelet library with an adiabatic strained laminar flamelet model, using pseudo-arc
+        length continuation to compute the unsteady branch of the s-curve
+
+    Parameters
+    ----------
+    flamelet_specs : dictionary or FlameletSpec instance
+        data for the mechanism, streams, mixture fraction grid, etc.
+    n_points : int
+        Number of points to compute on the S-curve
+    delta_s : float
+        Initial arc length step size for continuation
+    verbose : bool
+        whether or not to show progress of the library construction
+    solver_verbose : bool
+        whether or not to show detailed progress of sub-solvers in generating the library
+    diss_rate_log_scaled : bool
+        whether or not the range of dissipation rates is logarithmically scaled
+    
+    Returns
+    -------
+    library : spitfire.chemistry.library.Library instance
+        the structured chemistry library
+
+    """
+
+    if isinstance(flamelet_specs, dict):
+        flamelet_specs = FlameletSpec(**flamelet_specs)
+
+    m = flamelet_specs.mech_spec
+    fuel = flamelet_specs.fuel_stream
+    oxy = flamelet_specs.oxy_stream
+    flamelet_specs.initial_condition = 'equilibrium'
+
+    cput00 = _write_library_header('adiabatic SLFM with continuation', m, fuel, oxy, verbose)
+
+    flamelet = Flamelet(flamelet_specs)
+
+    if verbose:
+        print(f'Computing S-curve with pseudo-arc length continuation...')
+        print(f'Number of points: {n_points}')
+        print(f'Initial arc length step size: {delta_s}')
+        print(f'Maximum number of turns: {max_turns}')
+
+    # Compute the S-curve
+    s_curve_library = flamelet.compute_s_curve(n_points, delta_s)
+
+    if verbose:
+        print(f'S-curve computation completed.')
+        print(f'Number of points on the S-curve: {len(s_curve_library.dims[0].values)}')
+
+    # Reorganize the library to match the expected format
+    chi_st_values = s_curve_library.dims[0].values
+    z_values = s_curve_library.dims[1].values
+
+    z_dim = Dimension(_mixture_fraction_name, z_values)
+    x_dim = Dimension(_dissipation_rate_name + _stoich_suffix, chi_st_values, diss_rate_log_scaled)
+
+    output_library = Library(z_dim, x_dim)
+    output_library.extra_attributes['mech_spec'] = m
+
+    for quantity in s_curve_library.props:
+        output_library[quantity] = s_curve_library[quantity].T
+
+    _write_library_footer(cput00, verbose)
+    return output_library
+
+
 def _expand_enthalpy_defect_dimension_transient(chi_st, managed_dict, flamelet_specs, table_dict,
                                                 h_stoich_spacing, verbose, input_integration_args, solver_verbose):
     flamelet_specs.initial_condition = table_dict[chi_st]['adiabatic_state']
