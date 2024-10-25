@@ -10,6 +10,7 @@ from .chemistry.reactors import HomogeneousReactor
 from .chemistry.tabulation import build_adiabatic_eq_library, \
     build_adiabatic_bs_library, \
     build_adiabatic_slfm_library, \
+    build_adiabatic_slfm_psalc_library, \
     build_unreacted_library, \
     build_nonadiabatic_defect_bs_library, \
     build_nonadiabatic_defect_eq_library, \

@@ -1776,3 +1776,186 @@ class Flamelet(object):
                 for p in transient_library.props:
                     steady_library[p] = transient_library[p][-1, :].ravel()
                 return steady_library
+    
+    def _take_continuation_step(self,
+                                dlnchi_ds,
+                                dT_ds,
+                                delta_s,
+                                delta_T_ref=20.0,
+                                delta_lnchi_ref=np.log(1.3),
+                                tolerance=1.e-6,
+                                max_iterations=10,
+                                max_factor_line_search=1.5,
+                                max_allowed_residual=1.e6,
+                                min_allowable_state_var=-1.e-6,
+                                norm_order=np.inf,
+                                log_rate=100000,
+                                verbose=False):
+        """Take a continuation step in the arc-length continuation algorithm
+            Newton's method is used to solve the nonlinear system of equations. The system
+            is augmented with an update rule for the scalar dissipation rate.
+
+            Parameters
+            ----------
+            dlnchi_ds : float
+                the derivative of the scalar dissipation rate with respect to the arc length
+            dT_ds : float
+                the derivative of the maximum temperature with respect to the arc length
+            delta_s : float
+                the arc length step size
+            delta_T_ref : float
+                the reference temperature change for the arc length step size
+            delta_lnchi_ref : float
+                the reference scalar dissipation rate change for the arc length step size
+            tolerance : float
+                residual tolerance below which the solution has converged
+            max_iterations : int
+                maximum number of iterations before failure is detected
+            max_factor_line_search : float
+                the maximum factor by which the residual is allowed to increase in the line search algorithm
+            max_allowed_residual : float
+                the maximum allowable value of the residual
+            min_allowable_state_var : float
+                the lowest value (negative or zero) that a state variable can take during the solution process
+            norm_order : int or np.inf
+                the order of the norm used in measuring the residual
+            log_rate : int
+                how often a message about the solution status is written
+            verbose : bool
+                whether or not to write out status and failure messages
+        
+            Returns
+            -------
+                a tuple of a library containing temperature, mass fractions, and pressure over mixture fraction,
+                and the required iteration count, whether or not the system converged,
+                although if convergence is not obtained, then the library and iteration count output will both be None
+        """
+
+        def verbose_print(message):
+            if verbose:
+                print(message)
+        
+        state = np.copy(self.current_interior_state)
+        inv_dofscales = 1. / self._variable_scales
+        inv_dofscales = np.append(inv_dofscales, 1.)
+        chi_max_0 = self._max_dissipation_rate
+        T_max_0 = np.max(self.current_temperature)
+
+        rhs_method = getattr(self, '_' + self._heat_transfer + '_rhs')
+        jac_method = getattr(self, '_' + self._heat_transfer + '_jac')
+
+        iteration_count = 0
+        out_count = 0
+
+        res_aug = tolerance + 1.
+        
+        rhs = rhs_method(0., state)
+        T_max = np.max(state[::self._n_equations])
+        chi_max = self._max_dissipation_rate
+        rhs_lnchi = (((T_max - T_max_0) / delta_T_ref) * dT_ds +
+                     ((np.log(chi_max) - np.log(chi_max_0)) / delta_lnchi_ref) * dlnchi_ds -
+                     delta_s)
+        rhs_aug = np.append(rhs, rhs_lnchi)
+
+        nzi = self._nz_interior
+        neq = self._n_equations
+
+        evaluate_jacobian = True
+        while res_aug > tolerance and iteration_count < max_iterations:
+            iteration_count += 1
+            out_count += 1
+
+            if evaluate_jacobian:
+                J = -jac_method(state)
+
+                py_btddod_full_factorize(J, nzi, neq,
+                                         self._block_thomas_l_values,
+                                         self._block_thomas_d_pivots)
+                evaluate_jacobian = False
+            
+            dstate = np.zeros(self._n_dof)
+            py_btddod_full_solve(J,
+                                 self._block_thomas_l_values,
+                                 self._block_thomas_d_pivots,
+                                 rhs, nzi, neq, dstate)
+            state_new = state + dstate
+            
+            if any(logical_or(isinf(dstate), isnan(dstate))):
+                verbose_print('nan/inf detected in state update!')
+                return None, None, False
+
+            norm_rhs_aug_old = norm(rhs_aug * inv_dofscales, ord=norm_order)
+            alpha = 1.
+            rhs = rhs_method(0., state_new)
+            T_max = np.max(state_new[::self._n_equations])
+            chi_max = self._max_dissipation_rate
+            rhs_lnchi = (((T_max - T_max_0) / delta_T_ref) * dT_ds +
+                        ((np.log(chi_max) - np.log(chi_max_0)) / delta_lnchi_ref) * dlnchi_ds -
+                        delta_s)
+            rhs_aug = np.append(rhs, rhs_lnchi)
+            dlnchi = alpha * rhs_lnchi
+
+            if any(logical_or(isinf(rhs_aug), isnan(rhs_aug))):
+                verbose_print('nan/inf detected in state update!')
+                return None, None, False
+            
+            while norm(rhs_aug * inv_dofscales, ord=norm_order) > 1.5 * norm_rhs_aug_old and alpha > 0.001:
+                alpha *= 0.5
+                dstate *= alpha
+                dlnchi *= alpha
+
+                state_new = state + dstate
+                self._max_dissipation_rate = np.exp(np.log(chi_max) + dlnchi)
+                self._x = self._compute_dissipation_rate(self._z,
+                                                         self._max_dissipation_rate,
+                                                         self._dissipation_rate_form)
+
+                rhs = rhs_method(0., state_new)
+                T_max = np.max(state_new[::self._n_equations])
+                chi_max = self._max_dissipation_rate
+                rhs_lnchi = (((T_max - T_max_0) / delta_T_ref) * dT_ds +
+                            ((np.log(chi_max) - np.log(chi_max_0)) / delta_lnchi_ref) * dlnchi_ds -
+                            delta_s)
+                rhs_aug = np.append(rhs, rhs_lnchi)
+
+                verbose_print(f'  line search reducing step size to {alpha:.3f}')
+                evaluate_jacobian = True
+            
+            # Apply the update
+            state = state_new
+            self._max_dissipation_rate = np.exp(np.log(chi_max) + dlnchi)
+            self._x = self._compute_dissipation_rate(self._z,
+                                                     self._max_dissipation_rate,
+                                                     self._dissipation_rate_form)
+
+            res_aug = norm(rhs_aug * inv_dofscales, ord=norm_order)
+
+            if res_aug > max_allowed_residual:
+                message = 'Convergence failure! Residual of {:.2e} detected, ' \
+                          'exceeds the maximum allowable value of {:.2e}.'.format(res_aug, max_allowed_residual)
+                verbose_print(message)
+                return None, None, False
+
+            if np.min(state) < min_allowable_state_var:
+                message = 'Convergence failure! ' \
+                          'Mass fraction or temperature < ' \
+                          'min_allowable_state_var detected.'.format(res_aug, max_allowed_residual)
+                verbose_print(message)
+                return None, None, False
+
+            if out_count == log_rate and verbose:
+                out_count = 0
+                maxT = np.max(state)
+                print('   - iter {:4}, |residual| = {:7.2e}, max(T) = {:6.1f}'.format(iteration_count, res_aug, maxT))
+
+        state[state < 0] = 0.
+        output_library = self.make_library_from_interior_state(state)
+
+        if iteration_count > max_iterations or res_aug > tolerance:
+            message = 'Convergence failure! ' \
+                      'Too many iterations required, more than allowable {:}.'.format(max_iterations)
+            verbose_print(message)
+            return None, None, False
+        else:
+            self._current_state = np.copy(state)
+            return output_library, iteration_count, True

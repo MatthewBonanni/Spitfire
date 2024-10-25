@@ -248,6 +248,8 @@ def build_adiabatic_slfm_library(flamelet_specs,
         the reference point of the specified dissipation rate values, either 'stoichiometric' or 'maximum'
     verbose : bool
         whether or not to show progress of the library construction
+    solver_verbose : bool
+        whether or not to show the solver output for each flamelet
     include_extinguished : bool
         whether or not to include extinguished states in the output table, if encountered in the provided range of
         dissipation rates, off by default
@@ -334,6 +336,139 @@ def build_adiabatic_slfm_library(flamelet_specs,
 
         _write_library_footer(cput00, verbose)
         return output_library
+
+
+def build_adiabatic_slfm_psalc_library(flamelet_specs,
+                                       n_points=200,
+                                       chi_increasing=True,
+                                       verbose=True,
+                                       solver_verbose=False):
+    """Build a flamelet library with an adiabatic strained laminar flamelet model, using pseudo-arc
+        length continuation to compute the unstable branch of the S-curve
+    
+    Parameters
+    ----------
+    flamelet_specs : dictionary or FlameletSpec instance
+        data for the mechanism, streams, mixture fraction grid, etc.
+    n_points : int
+        the number of points to compute on the S-curve
+    chi_increasing : bool
+        whether or not the direction of the continuation is increasing in the dissipation rate
+    verbose : bool
+        whether or not to show progress of the library construction
+    solver_verbose : bool
+        whether or not to show the solver output for each continuation step
+    
+    Returns
+    -------
+    library : spitfire.chemistry.library.Library instance
+        the structured chemistry library
+
+    """
+
+    if isinstance(flamelet_specs, dict):
+        flamelet_specs = FlameletSpec(**flamelet_specs)
+
+    m = flamelet_specs.mech_spec
+    fuel = flamelet_specs.fuel_stream
+    oxy = flamelet_specs.oxy_stream
+    flamelet_specs.initial_condition = 'equilibrium'
+
+    cput00 = _write_library_header('adiabatic SLFM with continuation', m, fuel, oxy, verbose)
+
+    flamelet = Flamelet(flamelet_specs)
+    z_st = flamelet.mechanism.stoich_mixture_fraction(flamelet.fuel_stream, flamelet.oxy_stream)
+    chi_st = flamelet._compute_dissipation_rate(np.array([z_st]),
+                                                flamelet._max_dissipation_rate,
+                                                flamelet._dissipation_rate_form)[0]
+    suffix = _stoich_suffix
+
+    # Prepare containers and iterators
+    idx = 0
+    table_dict = dict()
+    x_values = list()
+
+    # Prepare continuation variables
+    dlnchi_ds = 1.0
+    dT_ds = 0.0
+    delta_s = 1.0e-5
+    if not chi_increasing:
+        delta_s = -delta_s
+    delta_lnchi_ref = np.log(1.3)
+    delta_T_ref = 20.0
+
+    while True:
+        if verbose:
+            print(f'{idx + 1:4}/{n_points:4} (chi{suffix} = {chi_st:8.1e} 1/s) ', end='', flush=True)
+
+        if idx == 0:
+            # Solve the flamelet in the initial state
+            flamelet = Flamelet(flamelet_specs)
+            cput0 = perf_counter()
+            library = flamelet.compute_steady_state(tolerance=1.e-6, verbose=solver_verbose, use_psitc=True)
+            dcput = perf_counter() - cput0
+        else:
+            # Take a continuation step
+            cput0 = perf_counter()
+            _, _, success = flamelet._take_continuation_step(dlnchi_ds, dT_ds, delta_s, delta_T_ref, delta_lnchi_ref,
+                                                             verbose=solver_verbose)
+            if not success:
+                if verbose:
+                    print(' continuation failed, stopping. The failed state will not be included in the table.')
+                break
+            library = flamelet.compute_steady_state(tolerance=1.e-6, verbose=solver_verbose, use_psitc=True)
+            dcput = perf_counter() - cput0
+
+        # Compute relevant quantities
+        z_st = flamelet.mechanism.stoich_mixture_fraction(flamelet.fuel_stream, flamelet.oxy_stream)
+        chi_st = flamelet._compute_dissipation_rate(np.array([z_st]),
+                                                    flamelet._max_dissipation_rate,
+                                                    flamelet._dissipation_rate_form)[0]
+        T_max = np.max(flamelet.current_temperature)
+
+        # Check for extinction
+        if np.max(flamelet.current_temperature - flamelet.linear_temperature) < 10.:
+            if verbose:
+                print(' extinction detected, stopping. The extinguished state will not be included in the table.')
+            break
+        else:
+            if verbose:
+                print(f' converged in {dcput:6.2f} s, T_max = {T_max:6.1f}')
+
+        # Store the solution
+        x_values.append(chi_st)
+        table_dict[chi_st] = dict()
+        for k in library.props:
+            table_dict[chi_st][k] = library[k].ravel()
+
+        # Compute the arc length tangent
+        if idx > 0:
+            dlnchi_ds = (np.log(chi_st) - np.log(chi_st_old)) / (delta_lnchi_ref * delta_s)
+            dT_ds = (T_max - T_max_old) / (delta_T_ref * delta_s)
+            delta_s = np.abs(dlnchi_ds) + np.abs(dT_ds)
+            breakpoint()
+            if not chi_increasing:
+                delta_s = -delta_s
+        
+        # Update the continuation variables
+        chi_st_old = chi_st
+        T_max_old = T_max
+
+        idx += 1
+    
+    z_dim = Dimension(_mixture_fraction_name, flamelet.mixfrac_grid)
+    x_dim = Dimension(_dissipation_rate_name + _stoich_suffix, np.array(x_values))
+
+    output_library = Library(z_dim, x_dim)
+    output_library.extra_attributes['mech_spec'] = m
+
+    for quantity in table_dict[chi_st]:
+        output_library[quantity] = output_library.get_empty_dataset()
+        for ix, x in enumerate(x_values):
+            output_library[quantity][:, ix] = table_dict[x][quantity]
+    
+    _write_library_footer(cput00, verbose)
+    return output_library
 
 
 def _expand_enthalpy_defect_dimension_transient(chi_st, managed_dict, flamelet_specs, table_dict,
